@@ -1,12 +1,28 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
 import uuid
 import numpy as np
 from typing import List, Dict, Optional
 from datetime import datetime
+from bson import ObjectId
+import json
 
 import redis
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
+
+# Add JSONEncoder to handle ObjectId
+class JSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, ObjectId):
+            return str(o)
+        return json.JSONEncoder.default(self, o)
+
+app = Flask(__name__)
+# Configure Flask to use the custom JSON encoder
+app.json_encoder = JSONEncoder
+CORS(app)
 
 class ChatRetriever:
     def __init__(
@@ -70,13 +86,13 @@ class ChatRetriever:
         
         return sorted(results, key=lambda x: x['score'], reverse=True)[:top_k]
 
-    def create_chat_log(self, input_text: str) -> Dict:
+    def create_chat_log(self, input_text: str, conversation_id: Optional[str] = None) -> Dict:
         """Create a new chat log with retrieved context."""
         retrieved_docs = self.retrieve_similar_docs(input_text)
         
         chat_log = {
             "uuid": str(uuid.uuid4()),
-            "conversationID": str(uuid.uuid1()),
+            "conversationID": conversation_id if conversation_id else str(uuid.uuid1()),
             "question": input_text,
             "answer": retrieved_docs[0]['text'] if retrieved_docs else "",
             "rating": None,
@@ -85,8 +101,9 @@ class ChatRetriever:
             "timestamp": datetime.now().isoformat()
         }
         
-        # Save to MongoDB
-        self.chat_collection.insert_one(chat_log)
+        # Save to MongoDB and get the inserted document
+        result = self.chat_collection.insert_one(chat_log)
+        chat_log['_id'] = str(result.inserted_id)  # Convert ObjectId to string before returning
         
         return chat_log
 
@@ -110,21 +127,67 @@ class ChatRetriever:
             query['conversationID'] = conversation_id
         if uuid_str:
             query['uuid'] = uuid_str
+
+        chat_log = self.chat_collection.find_one(query)
         
-        return self.chat_collection.find_one(query)
+        if chat_log:
+            chat_log['_id'] = str(chat_log['_id'])
+
+        return chat_log
+
+    def retrieve_conversation_history(self, conversation_id: str) -> List[Dict]:
+        """Retrieve all chat logs for a specific conversation."""
+        chat_logs = list(self.chat_collection.find({'conversationID': conversation_id}))
+        
+        # Convert ObjectId to string for each document
+        for log in chat_logs:
+            log['_id'] = str(log['_id'])
+
+        return chat_logs
 
     def close_connections(self):
         """Close database connections."""
         self.redis_client.close()
         self.mongo_client.close()
 
+# Initialize the ChatRetriever
+retriever = ChatRetriever()
 
-def main():
-    retriever = ChatRetriever()
-    chat_log = retriever.create_chat_log("Give me a bird fact")
-    retrieved_log = retriever.retrieve_chat_log(conversation_id=chat_log['conversationID'])
-    print(retrieved_log)
-    retriever.close_connections()
+@app.route('/api/chat', methods=['POST'])
+def create_chat():
+    data = request.json
+    question = data.get('question')
+    conversation_id = data.get('conversation_id')
+    
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+    
+    chat_log = retriever.create_chat_log(question, conversation_id)
+    return jsonify(chat_log), 201
+
+@app.route('/api/chat/<conversation_id>', methods=['GET'])
+def get_conversation(conversation_id):
+    conversation_history = retriever.retrieve_conversation_history(conversation_id)
+    if not conversation_history:
+        return jsonify({"error": "Conversation not found"}), 404
+    
+    return jsonify(conversation_history), 200
+
+@app.route('/api/chat/<conversation_id>/<uuid_str>', methods=['GET'])
+def get_chat_log(conversation_id, uuid_str):
+    chat_log = retriever.retrieve_chat_log(conversation_id, uuid_str)
+    if not chat_log:
+        return jsonify({"error": "Chat log not found"}), 404
+    
+    return jsonify(chat_log), 200
+
+@app.route('/api/chat/<conversation_id>', methods=['DELETE'])
+def delete_conversation(conversation_id):
+    result = retriever.chat_collection.delete_many({'conversationID': conversation_id})
+    if result.deleted_count == 0:
+        return jsonify({"error": "Conversation not found"}), 404
+    
+    return jsonify({"message": "Conversation deleted"}), 200
 
 if __name__ == "__main__":
-    main()
+    app.run(debug=True)
